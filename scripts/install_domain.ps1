@@ -26,7 +26,11 @@ function Get-ActiveAdapter {
             -InterfaceIndex $DefaultRoute.InterfaceIndex `
             -ErrorAction SilentlyContinue
 
-        if ($Adapter -and $Adapter.Status -eq "Up") {
+        if (
+            $Adapter -and
+            $Adapter.Status -eq "Up" -and
+            $Adapter.HardwareInterface
+        ) {
             return $Adapter
         }
     }
@@ -40,6 +44,17 @@ function Get-ActiveAdapter {
         Select-Object -First 1
 }
 
+function Test-DomainSecureChannel {
+    try {
+        return [bool](Test-ComputerSecureChannel `
+            -Server $DomainController `
+            -ErrorAction Stop)
+    }
+    catch {
+        return $false
+    }
+}
+
 try {
     $WindowsEdition = (Get-ComputerInfo).WindowsProductName
 
@@ -49,20 +64,36 @@ try {
 
     $ComputerSystem = Get-CimInstance Win32_ComputerSystem
 
+    # Se a máquina já pertence a algum domínio, verifique a confiança.
     if ($ComputerSystem.PartOfDomain) {
         if ($ComputerSystem.Domain -ine $Domain) {
             throw "Este computador já pertence ao domínio $($ComputerSystem.Domain)."
         }
 
         Write-Host "Este computador já pertence ao domínio $Domain."
+        Write-Host "Nome da estação: $env:COMPUTERNAME"
         Write-Host "Verificando a relação de confiança..."
 
-        if (Test-ComputerSecureChannel -Server $DomainController -Quiet) {
+        if (Test-DomainSecureChannel) {
             Write-Host "A relação de confiança está íntegra."
             exit 0
         }
 
         Write-Warning "A relação de confiança está quebrada."
+
+        Write-Warning @"
+Antes de reparar, confirme que nenhum outro computador do domínio usa o nome:
+$env:COMPUTERNAME
+
+Se houver dois computadores com esse mesmo nome, não execute o reparo nos dois.
+Renomeie uma das estações e ingresse-a novamente com um nome exclusivo.
+"@
+
+        $Confirmation = Read-Host "Digite REPARAR para continuar"
+
+        if ($Confirmation -ine "REPARAR") {
+            throw "Reparo cancelado."
+        }
 
         $Credential = Get-Credential `
             -UserName $DomainUser `
@@ -73,27 +104,24 @@ try {
         $Repaired = Test-ComputerSecureChannel `
             -Repair `
             -Server $DomainController `
-            -Credential $Credential
+            -Credential $Credential `
+            -ErrorAction Stop
 
         if (-not $Repaired) {
             throw @"
 Não foi possível reparar a relação de confiança.
 
-Verifique se outro computador está usando o nome:
-$env:COMPUTERNAME
-
-Se houver nome duplicado, não repare os dois com o mesmo nome.
-Renomeie uma das estações e ingresse-a novamente no domínio.
+Verifique se outro computador usa o nome $env:COMPUTERNAME.
+Se o nome estiver duplicado, coloque esta estação temporariamente em um grupo
+de trabalho e faça um novo ingresso usando um nome exclusivo.
 "@
         }
 
-        if (-not (Test-ComputerSecureChannel `
-                    -Server $DomainController `
-                    -Quiet)) {
+        if (-not (Test-DomainSecureChannel)) {
             throw "O reparo foi executado, mas o canal seguro continua inválido."
         }
 
-        Write-Host "Relação de confiança reparada."
+        Write-Host "Relação de confiança reparada com sucesso."
         Write-Host "Reiniciando em 15 segundos..."
 
         Start-Sleep -Seconds 15
@@ -101,6 +129,7 @@ Renomeie uma das estações e ingresse-a novamente no domínio.
         exit 0
     }
 
+    # Solicita um nome exclusivo para máquinas ainda fora do domínio.
     if ([string]::IsNullOrWhiteSpace($ComputerName)) {
         $ComputerName = Read-Host `
             "Informe um nome EXCLUSIVO para este PC (ex.: COUDE-PC-01)"
@@ -120,22 +149,22 @@ Exemplo: COUDE-PC-01
 "@
     }
 
-    if ($ComputerName -in @(
-        "DESKTOP",
-        "COMPUTADOR",
-        "WINDOWS",
-        "COUDE-PC",
-        "PC"
-    )) {
+    if (
+        $ComputerName -in @(
+            "DESKTOP",
+            "COMPUTADOR",
+            "WINDOWS",
+            "COUDE-PC",
+            "PC"
+        )
+    ) {
         throw "Escolha um nome específico e exclusivo, como COUDE-PC-01."
     }
 
     Write-Host ""
     Write-Host "Nome atual: $env:COMPUTERNAME"
     Write-Host "Nome que será cadastrado: $ComputerName"
-    Write-Host ""
-    Write-Warning `
-        "Não use este nome em nenhum outro computador do domínio."
+    Write-Warning "Não use '$ComputerName' em nenhum outro computador."
 
     $Confirmation = Read-Host "Digite SIM para continuar"
 
@@ -146,11 +175,11 @@ Exemplo: COUDE-PC-01
     $ActiveAdapter = Get-ActiveAdapter
 
     if (-not $ActiveAdapter) {
-        throw "Nenhuma interface de rede ativa foi encontrada."
+        throw "Nenhuma interface física de rede ativa foi encontrada."
     }
 
     Write-Host "Interface ativa: $($ActiveAdapter.Name)"
-    Write-Host "Configurando $DnsServer como DNS..."
+    Write-Host "Configurando $DnsServer como DNS IPv4..."
 
     Set-DnsClientServerAddress `
         -InterfaceIndex $ActiveAdapter.IfIndex `
@@ -160,13 +189,14 @@ Exemplo: COUDE-PC-01
         (
             Get-DnsClientServerAddress `
                 -InterfaceIndex $ActiveAdapter.IfIndex `
-                -AddressFamily IPv6
+                -AddressFamily IPv6 `
+                -ErrorAction SilentlyContinue
         ).ServerAddresses
     )
 
     if ($IPv6Dns -contains "fe80::1") {
-        Write-Host `
-            "DNS IPv6 fe80::1 detectado. Desabilitando IPv6 temporariamente..."
+        Write-Host "DNS IPv6 fe80::1 detectado."
+        Write-Host "Desabilitando IPv6 temporariamente nesta interface..."
 
         Disable-NetAdapterBinding `
             -Name $ActiveAdapter.Name `
@@ -178,10 +208,14 @@ Exemplo: COUDE-PC-01
 
     Write-Host "Testando comunicação com o servidor..."
 
-    if (-not (Test-Connection `
+    if (
+        -not (
+            Test-Connection `
                 -ComputerName $DnsServer `
                 -Count 2 `
-                -Quiet)) {
+                -Quiet
+        )
+    ) {
         throw "O servidor $DnsServer não respondeu ao ping."
     }
 
@@ -209,16 +243,27 @@ Exemplo: COUDE-PC-01
         throw "O registro SRV LDAP do domínio não foi encontrado."
     }
 
+    $ValidLdapRecord = $SrvRecord |
+        Where-Object {
+            $_.NameTarget.TrimEnd(".") -ieq $DomainController -and
+            $_.Port -eq 389
+        } |
+        Select-Object -First 1
+
+    if (-not $ValidLdapRecord) {
+        throw "O registro SRV LDAP não aponta para $DomainController na porta 389."
+    }
+
     foreach ($Port in 53, 88, 389, 445) {
         Write-Host "Testando a porta TCP $Port..."
 
-        $Open = Test-NetConnection `
+        $PortOpen = Test-NetConnection `
             -ComputerName $DnsServer `
             -Port $Port `
             -InformationLevel Quiet `
             -WarningAction SilentlyContinue
 
-        if (-not $Open) {
+        if (-not $PortOpen) {
             throw "A porta TCP $Port não está acessível em $DnsServer."
         }
     }
@@ -232,8 +277,11 @@ Exemplo: COUDE-PC-01
     }
 
     Write-Host ""
-    Write-Host "Antes de continuar, confirme que '$ComputerName' nunca foi"
-    Write-Host "atribuído a outra estação ativa."
+    Write-Warning @"
+Confirme que '$ComputerName' nunca foi atribuído a outra estação ativa.
+Nomes duplicados fazem as máquinas compartilharem a mesma conta no AD e
+causam a falha da relação de confiança.
+"@
 
     $Credential = Get-Credential `
         -UserName $DomainUser `
