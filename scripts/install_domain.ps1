@@ -3,8 +3,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $false)]
-    [ValidatePattern('^[A-Za-z0-9-]{1,15}$')]
-    [string]$NovoNome
+    [string]$ComputerName
 )
 
 $ErrorActionPreference = "Stop"
@@ -13,25 +12,8 @@ $Domain = "ad.coude.com.br"
 $DomainController = "srv1.ad.coude.com.br"
 $DnsServer = "192.168.1.10"
 $DomainUser = "Administrator@ad.coude.com.br"
-$JoinStatePath = "$env:ProgramData\COUDE\domain-join-state.json"
 
-function Stop-WithError {
-    param([string]$Message)
-
-    throw $Message
-}
-
-function Test-TcpPort {
-    param([int]$Port)
-
-    return Test-NetConnection `
-        -ComputerName $DnsServer `
-        -Port $Port `
-        -InformationLevel Quiet `
-        -WarningAction SilentlyContinue
-}
-
-function Get-ActivePhysicalAdapter {
+function Get-ActiveAdapter {
     $DefaultRoute = Get-NetRoute `
         -AddressFamily IPv4 `
         -DestinationPrefix "0.0.0.0/0" `
@@ -44,7 +26,7 @@ function Get-ActivePhysicalAdapter {
             -InterfaceIndex $DefaultRoute.InterfaceIndex `
             -ErrorAction SilentlyContinue
 
-        if ($Adapter.Status -eq "Up" -and $Adapter.HardwareInterface) {
+        if ($Adapter -and $Adapter.Status -eq "Up") {
             return $Adapter
         }
     }
@@ -62,33 +44,31 @@ try {
     $WindowsEdition = (Get-ComputerInfo).WindowsProductName
 
     if ($WindowsEdition -match "\bHome\b") {
-        Stop-WithError `
-            "O Windows Home não pode ingressar em um domínio Active Directory."
+        throw "O Windows Home não pode ingressar em um domínio Active Directory."
     }
 
     $ComputerSystem = Get-CimInstance Win32_ComputerSystem
-    $CurrentName = $env:COMPUTERNAME.ToUpperInvariant()
 
     if ($ComputerSystem.PartOfDomain) {
         if ($ComputerSystem.Domain -ine $Domain) {
-            Stop-WithError `
-                "Este computador já pertence ao domínio $($ComputerSystem.Domain)."
+            throw "Este computador já pertence ao domínio $($ComputerSystem.Domain)."
         }
 
-        Write-Host "A máquina já pertence ao domínio. Verificando o canal seguro..."
+        Write-Host "Este computador já pertence ao domínio $Domain."
+        Write-Host "Verificando a relação de confiança..."
 
         if (Test-ComputerSecureChannel -Server $DomainController -Quiet) {
-            Write-Host "Canal seguro íntegro. Nenhuma alteração é necessária."
+            Write-Host "A relação de confiança está íntegra."
             exit 0
         }
 
-        Write-Warning "O canal seguro desta máquina está quebrado."
+        Write-Warning "A relação de confiança está quebrada."
 
         $Credential = Get-Credential `
             -UserName $DomainUser `
-            -Message "Informe uma credencial autorizada a reparar esta estação"
+            -Message "Informe a senha do administrador para reparar esta estação"
 
-        Write-Host "Reparando a conta de máquina $CurrentName..."
+        Write-Host "Reparando o canal seguro de $env:COMPUTERNAME..."
 
         $Repaired = Test-ComputerSecureChannel `
             -Repair `
@@ -96,67 +76,81 @@ try {
             -Credential $Credential
 
         if (-not $Repaired) {
-            Stop-WithError `
-                "Não foi possível reparar o canal seguro. Verifique se outra estação usa o nome $CurrentName."
+            throw @"
+Não foi possível reparar a relação de confiança.
+
+Verifique se outro computador está usando o nome:
+$env:COMPUTERNAME
+
+Se houver nome duplicado, não repare os dois com o mesmo nome.
+Renomeie uma das estações e ingresse-a novamente no domínio.
+"@
         }
 
         if (-not (Test-ComputerSecureChannel `
                     -Server $DomainController `
                     -Quiet)) {
-            Stop-WithError `
-                "A reparação foi executada, mas o canal seguro continua inválido."
+            throw "O reparo foi executado, mas o canal seguro continua inválido."
         }
 
-        Write-Host "Canal seguro reparado. Reiniciando em 15 segundos..."
+        Write-Host "Relação de confiança reparada."
+        Write-Host "Reiniciando em 15 segundos..."
+
         Start-Sleep -Seconds 15
         Restart-Computer -Force
         exit 0
     }
 
-    if (-not $NovoNome) {
-        do {
-            $NovoNome = (
-                Read-Host `
-                    "Informe um nome EXCLUSIVO para este PC (ex.: COUDE-PC-01)"
-            ).Trim().ToUpperInvariant()
-
-            $NomeValido = (
-                $NovoNome -match "^[A-Z0-9-]{1,15}$" -and
-                $NovoNome -notmatch "^-|-$" -and
-                $NovoNome -notin @(
-                    "DESKTOP",
-                    "COMPUTADOR",
-                    "WINDOWS",
-                    "COUDE-PC",
-                    "PC"
-                )
-            )
-
-            if (-not $NomeValido) {
-                Write-Warning `
-                    "Use de 1 a 15 caracteres: letras, números e hífen. O nome deve ser exclusivo."
-            }
-        } until ($NomeValido)
+    if ([string]::IsNullOrWhiteSpace($ComputerName)) {
+        $ComputerName = Read-Host `
+            "Informe um nome EXCLUSIVO para este PC (ex.: COUDE-PC-01)"
     }
 
-    $NovoNome = $NovoNome.Trim().ToUpperInvariant()
+    $ComputerName = $ComputerName.Trim().ToUpperInvariant()
 
     if (
-        $NovoNome -notmatch "^[A-Z0-9-]{1,15}$" -or
-        $NovoNome -match "^-|-$"
+        $ComputerName -notmatch "^[A-Z0-9](?:[A-Z0-9-]{0,13}[A-Z0-9])?$"
     ) {
-        Stop-WithError `
-            "Nome inválido. Use de 1 a 15 caracteres: letras, números e hífen."
+        throw @"
+Nome de computador inválido: $ComputerName
+
+Use de 1 a 15 caracteres, apenas letras, números e hífen.
+O nome não pode começar nem terminar com hífen.
+Exemplo: COUDE-PC-01
+"@
     }
 
-    $ActiveAdapter = Get-ActivePhysicalAdapter
+    if ($ComputerName -in @(
+        "DESKTOP",
+        "COMPUTADOR",
+        "WINDOWS",
+        "COUDE-PC",
+        "PC"
+    )) {
+        throw "Escolha um nome específico e exclusivo, como COUDE-PC-01."
+    }
+
+    Write-Host ""
+    Write-Host "Nome atual: $env:COMPUTERNAME"
+    Write-Host "Nome que será cadastrado: $ComputerName"
+    Write-Host ""
+    Write-Warning `
+        "Não use este nome em nenhum outro computador do domínio."
+
+    $Confirmation = Read-Host "Digite SIM para continuar"
+
+    if ($Confirmation -ine "SIM") {
+        throw "Operação cancelada."
+    }
+
+    $ActiveAdapter = Get-ActiveAdapter
 
     if (-not $ActiveAdapter) {
-        Stop-WithError "Nenhuma interface física de rede ativa foi encontrada."
+        throw "Nenhuma interface de rede ativa foi encontrada."
     }
 
     Write-Host "Interface ativa: $($ActiveAdapter.Name)"
-    Write-Host "Configurando $DnsServer como único DNS IPv4..."
+    Write-Host "Configurando $DnsServer como DNS..."
 
     Set-DnsClientServerAddress `
         -InterfaceIndex $ActiveAdapter.IfIndex `
@@ -170,30 +164,28 @@ try {
         ).ServerAddresses
     )
 
-    if (
-        $IPv6Dns |
-        Where-Object {
-            $_ -and
-            $_ -ne "::1" -and
-            $_ -notmatch "^fec0:0:0:ffff::"
-        }
-    ) {
-        Write-Warning `
-            "DNS IPv6 externo detectado: $($IPv6Dns -join ', '). Desabilitando IPv6 temporariamente."
+    if ($IPv6Dns -contains "fe80::1") {
+        Write-Host `
+            "DNS IPv6 fe80::1 detectado. Desabilitando IPv6 temporariamente..."
 
         Disable-NetAdapterBinding `
             -Name $ActiveAdapter.Name `
-            -ComponentID ms_tcpip6 | Out-Null
+            -ComponentID ms_tcpip6 |
+            Out-Null
     }
 
     Clear-DnsClientCache
+
+    Write-Host "Testando comunicação com o servidor..."
 
     if (-not (Test-Connection `
                 -ComputerName $DnsServer `
                 -Count 2 `
                 -Quiet)) {
-        Stop-WithError "O servidor $DnsServer não respondeu ao ping."
+        throw "O servidor $DnsServer não respondeu ao ping."
     }
+
+    Write-Host "Validando o registro DNS do controlador..."
 
     $ARecord = Resolve-DnsName `
         -Name $DomainController `
@@ -202,8 +194,10 @@ try {
         -DnsOnly
 
     if ($DnsServer -notin @($ARecord.IPAddress)) {
-        Stop-WithError "$DomainController não aponta para $DnsServer."
+        throw "$DomainController não aponta para $DnsServer."
     }
+
+    Write-Host "Validando o serviço LDAP..."
 
     $SrvRecord = Resolve-DnsName `
         -Name "_ldap._tcp.dc._msdcs.$Domain" `
@@ -211,24 +205,21 @@ try {
         -Server $DnsServer `
         -DnsOnly
 
-    if (
-        -not (
-            $SrvRecord |
-            Where-Object {
-                $_.NameTarget.TrimEnd(".") -ieq $DomainController -and
-                $_.Port -eq 389
-            }
-        )
-    ) {
-        Stop-WithError `
-            "O registro SRV LDAP não aponta corretamente para $DomainController."
+    if (-not $SrvRecord) {
+        throw "O registro SRV LDAP do domínio não foi encontrado."
     }
 
     foreach ($Port in 53, 88, 389, 445) {
         Write-Host "Testando a porta TCP $Port..."
 
-        if (-not (Test-TcpPort -Port $Port)) {
-            Stop-WithError "A porta TCP $Port não está acessível em $DnsServer."
+        $Open = Test-NetConnection `
+            -ComputerName $DnsServer `
+            -Port $Port `
+            -InformationLevel Quiet `
+            -WarningAction SilentlyContinue
+
+        if (-not $Open) {
+            throw "A porta TCP $Port não está acessível em $DnsServer."
         }
     }
 
@@ -237,58 +228,30 @@ try {
     & nltest.exe "/dsgetdc:$Domain" "/force"
 
     if ($LASTEXITCODE -ne 0) {
-        Stop-WithError "O Windows não conseguiu localizar o domínio $Domain."
+        throw "O Windows não conseguiu localizar o domínio $Domain."
     }
+
+    Write-Host ""
+    Write-Host "Antes de continuar, confirme que '$ComputerName' nunca foi"
+    Write-Host "atribuído a outra estação ativa."
 
     $Credential = Get-Credential `
         -UserName $DomainUser `
-        -Message "Informe uma credencial autorizada a ingressar computadores"
+        -Message "Informe a senha do administrador do domínio COUDE"
 
-    Write-Host "Verificando se o nome $NovoNome já existe no Active Directory..."
-
-    $ExistingComputer = Get-ADComputer `
-        -Identity "$NovoNome`$" `
-        -Server $DomainController `
-        -Credential $Credential `
-        -ErrorAction SilentlyContinue
-
-    if ($ExistingComputer) {
-        Stop-WithError @"
-A conta de computador '$NovoNome' já existe no Active Directory.
-Não será sobrescrita, pois ela pode pertencer a outra estação.
-Escolha outro nome exclusivo ou remova a conta antiga manualmente após confirmar que ela não está em uso.
-"@
-    }
-
-    $StateDirectory = Split-Path $JoinStatePath -Parent
-    New-Item `
-        -ItemType Directory `
-        -Path $StateDirectory `
-        -Force | Out-Null
-
-    [ordered]@{
-        ComputerName = $NovoNome
-        Domain       = $Domain
-        JoinedAt     = (Get-Date).ToString("o")
-    } |
-        ConvertTo-Json |
-        Set-Content `
-            -Path $JoinStatePath `
-            -Encoding UTF8
-
-    Write-Host "Ingressando $NovoNome no domínio $Domain..."
+    Write-Host "Ingressando $ComputerName no domínio $Domain..."
 
     Add-Computer `
         -DomainName $Domain `
-        -NewName $NovoNome `
         -Server $DomainController `
+        -NewName $ComputerName `
         -Credential $Credential `
-        -Options JoinWithNewName, AccountCreate `
+        -Options AccountCreate, JoinWithNewName `
         -Force
 
     Write-Host ""
-    Write-Host "Ingresso concluído."
-    Write-Host "Nome da estação: $NovoNome"
+    Write-Host "Ingresso concluído com sucesso."
+    Write-Host "Estação: $ComputerName"
     Write-Host "Domínio: $Domain"
     Write-Host "Reiniciando em 15 segundos..."
 
