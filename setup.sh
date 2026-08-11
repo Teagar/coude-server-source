@@ -605,7 +605,7 @@ section "9/19 · API Flask v2"
 
 mkdir -p "$API_DIR"
 python3 -m venv "$API_DIR/venv"
-"$API_DIR/venv/bin/pip" install --quiet flask gunicorn bcrypt
+"$API_DIR/venv/bin/pip" install --quiet flask gunicorn
 
 # Gerar chave de API (64 hex chars = 32 bytes)
 API_KEY=$(python3 -c "import secrets; print(secrets.token_hex(32))")
@@ -676,6 +676,9 @@ def validate_cpf(cpf):
         if int(cpf[i]) != (s * 10 % 11) % 10:
             return False
     return True
+
+def normalize_cpf(cpf):
+      return re.sub(r"\D", "", cpf)
 
 def gen_username(nome):
     r = subprocess.run(
@@ -751,21 +754,19 @@ def cadastrar():
     data = request.get_json(force=True) or {}
     log_op("/usuarios/cadastrar")
 
-    # Idempotência por id_externo
     id_ext = data.get("metadata", {}).get("id_externo", "")
     if id_ext and id_ext in IDEMPOTENCY:
         return jsonify(IDEMPOTENCY[id_ext]), 200
 
-    # ── Validações ────────────────────────────────────────────────────────
     errs = {}
 
-    nome = data.get("nome_completo", "")
+    nome = data.get("nome_completo", "").strip()
     if len(nome.split()) < 2:
         errs["nome_completo"] = "Mínimo 2 palavras"
 
-    email = data.get("email", "")
-    if not re.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', email):
-        errs["email"] = "Formato inválido (RFC 5321)"
+    email = data.get("email", "").strip()
+    if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
+        errs["email"] = "Formato inválido"
 
     cpf = data.get("cpf", "")
     if not validate_cpf(cpf):
@@ -775,10 +776,6 @@ def cadastrar():
     if cargo not in ("aluno", "professor", "monitor", "admin"):
         errs["cargo"] = "Valores: aluno | professor | monitor | admin"
 
-    senha_hash = data.get("senha_hash", "")
-    if not re.match(r'^\\\$2[abxy]?\\\$(1[2-9]|2[0-9]|3[01])\\\$', senha_hash):
-        errs["senha_hash"] = "bcrypt custo >= 12 obrigatório"
-
     turma = data.get("turma", "")
     if cargo in ("aluno", "monitor") and not turma:
         errs["turma"] = "Obrigatório para aluno e monitor"
@@ -786,61 +783,145 @@ def cadastrar():
     if errs:
         return jsonify({"ok": False, "errors": errs}), 422
 
-    # ── Criação ────────────────────────────────────────────────────────────
     try:
         username = gen_username(nome)
-        ou       = ou_for_cargo(cargo)
+        ou = ou_for_cargo(cargo)
         email_ad = f"{username}@ad.coude.com.br"
+        initial_password = f"Coude@{normalize_cpf(cpf)}!"
 
-        # Criar conta no AD com senha aleatória (usuário troca no login)
-        rc, out, err = samba(
-            "user", "create", username,
-            "--given-name",    nome.split()[0],
-            "--surname",       " ".join(nome.split()[1:]),
-            "--mail-address",  email_ad,
-            "--use-username-as-cn",
-            "--random-password"
+        rc, _, err = samba(
+            "user",
+            "create",
+            username,
+            initial_password,
+            "--given-name",
+            nome.split()[0],
+            "--surname",
+            " ".join(nome.split()[1:]),
+            "--mail-address",
+            email_ad,
+            "--use-username-as-cn"
+        )
+
+        if rc != 0:
+            logging.error(
+                "Falha ao criar usuário %s: %s",
+                username,
+                err.strip()
+            )
+            return jsonify({
+                "ok": False,
+                "error": "Não foi possível criar o usuário no Active Directory"
+            }), 500
+
+        rc, _, err = samba(
+            "user",
+            "setpassword",
+            username,
+            "--must-change-at-next-login"
+        )
+
+        if rc != 0:
+            samba("user", "delete", username)
+            logging.error(
+                "Falha ao exigir troca inicial para %s: %s",
+                username,
+                err.strip()
+            )
+            return jsonify({
+                "ok": False,
+                "error": "Não foi possível configurar a troca obrigatória da senha"
+            }), 500
+
+        rc, _, err = samba("user", "move", username, ou)
+        if rc != 0:
+            samba("user", "delete", username)
+            return jsonify({
+                "ok": False,
+                "error": "Não foi possível mover o usuário para a OU correta"
+            }), 500
+
+        rc, _, err = samba(
+            "group",
+            "addmembers",
+            group_for_cargo(cargo),
+            username
         )
         if rc != 0:
-            return jsonify({"ok": False, "error": err.strip()}), 500
+            samba("user", "delete", username)
+            return jsonify({
+                "ok": False,
+                "error": "Não foi possível associar o grupo de cargo"
+            }), 500
 
-        # Mover para OU correta
-        samba("user", "move", username, ou)
-
-        # Adicionar a grupos
-        samba("group", "addmembers", group_for_cargo(cargo), username)
         if turma:
-            samba("group", "addmembers", turma, username)
+            rc, _, err = samba(
+                "group",
+                "addmembers",
+                turma,
+                username
+            )
+            if rc != 0:
+                samba("user", "delete", username)
+                return jsonify({
+                    "ok": False,
+                    "error": "Não foi possível associar a turma"
+                }), 500
 
-        # Criar pastas e ACLs
         subprocess.run(
-            ["/usr/local/bin/coude-create-user-dir.sh", username, cargo],
+            [
+                "/usr/local/bin/coude-create-user-dir.sh",
+                username,
+                cargo
+            ],
             check=False
         )
+
         if turma and cargo in ("aluno", "monitor"):
             subprocess.run(
-                ["/usr/local/bin/coude-create-aluno-dir.sh", username, turma],
+                [
+                    "/usr/local/bin/coude-create-aluno-dir.sh",
+                    username,
+                    turma
+                ],
                 check=False
             )
 
         resp = {
-            "ok":       True,
+            "ok": True,
             "username": username,
             "email_ad": email_ad,
-            "pasta":    f"{SAMBA_DATA}/users/{username}",
-            "grupos":   [group_for_cargo(cargo)] + ([turma] if turma else [])
+            "pasta": f"{SAMBA_DATA}/users/{username}",
+            "grupos": (
+                [group_for_cargo(cargo)] +
+                ([turma] if turma else [])
+            ),
+            "must_change_password": True
         }
+
         if id_ext:
             IDEMPOTENCY[id_ext] = resp
 
-        logging.info(f"Usuário criado: {username} cargo={cargo} turma={turma}")
+        logging.info(
+            "Usuário criado: %s cargo=%s turma=%s",
+            username,
+            cargo,
+            turma
+        )
+
         return jsonify(resp), 201
 
-    except ValueError as ve:
-        return jsonify({"ok": False, "error": str(ve)}), 400
-    except Exception as ex:
-        logging.error(f"Erro ao criar usuário: {ex}")
-        return jsonify({"ok": False, "error": "Erro interno"}), 500
+    except ValueError as exc:
+        return jsonify({
+            "ok": False,
+            "error": str(exc)
+        }), 400
+    except Exception:
+        logging.exception("Erro inesperado ao criar usuário")
+        return jsonify({
+            "ok": False,
+            "error": "Erro interno"
+        }), 500
 
 
 @app.route("/api/v1/usuarios/remover", methods=["POST"])
@@ -1390,7 +1471,6 @@ echo "    -H 'Content-Type: application/json' \\"
 echo "    -d '{\"nome_completo\":\"Thiago Cerqueira\",\"email\":\"t@t.com\","
 echo "         \"cpf\":\"529.982.247-25\",\"cargo\":\"aluno\","
 echo "         \"turma\":\"turma_fullstack_001\","
-echo "         \"senha_hash\":\"\$2b\$12\$salthashaqui...\","
 echo "         \"metadata\":{\"id_externo\":\"EXT-001\"}}'"
 echo ""
 echo "  # Health check manual"
