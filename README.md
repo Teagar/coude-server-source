@@ -15,9 +15,11 @@ Infraestrutura baseada em Debian 13 com:
 .
 ├── docs
 │   ├── linux-setup.md
-│   └── windows-setup.md
+│   ├── windows-setup.md
+│   └── coude-documentacao-tecnica.md   # Documentação de integração da API
 ├── scripts
-│   └── install_domain.ps1
+│   ├── install_domain.ps1
+│   └── coude-update-api.sh             # Atualiza a API num servidor já instalado
 ├── infra.pdf
 ├── setup.sh
 └── validate.sh
@@ -46,6 +48,27 @@ sudo bash validate.sh
 
 Revise as configurações no início de `setup.sh` antes da instalação,
 principalmente a interface de rede, gateway e endereço IP.
+
+## Atualizando a API em um servidor já instalado
+
+Se o servidor já está no ar e você só quer aplicar uma versão nova da API
+(sem reprovisionar o domínio), use o script de atualização em vez de rodar
+`setup.sh` de novo:
+
+```bash
+sudo bash scripts/coude-update-api.sh
+```
+
+Ele detecta a configuração já instalada (IP, porta, diretórios), faz backup
+do `app.py` atual, aplica a nova versão e reinicia o serviço `coude-api`. Se
+o serviço não subir, reverte o backup automaticamente.
+
+## API — Integração
+
+Para quem quer consumir a API a partir de um sistema próprio (matrícula,
+portal, automação de cadastro), veja a documentação completa de integração:
+
+- [Documentação técnica da API](docs/coude-documentacao-tecnica.md)
 
 ## Clientes Windows
 
