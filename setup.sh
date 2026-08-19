@@ -127,6 +127,7 @@ apt-get update -qq
 apt-get install -y \
     samba krb5-user winbind smbclient dnsutils \
     acl attr python3-samba \
+    ldb-tools \
     quota \
     ufw \
     rsyslog \
@@ -621,7 +622,7 @@ COUDE API v2 — Flask
 Base URL: http://${SERVER_IP}:${API_PORT}/api/v1
 Auth: header X-API-Key
 """
-import os, subprocess, hashlib, hmac, time, re, logging
+import os, subprocess, hashlib, hmac, time, re, logging, secrets
 from datetime import datetime
 from functools import wraps
 from flask import Flask, request, jsonify
@@ -640,6 +641,8 @@ DC_SUFFIX    = "DC=ad,DC=coude,DC=com,DC=br"
 SAMBA_DATA   = "$SAMBA_DATA"
 SERVER_IP    = "$SERVER_IP"
 API_PORT     = $API_PORT
+API_VERSION  = "2.1.0"
+CARGOS       = ("aluno", "professor", "monitor", "admin")
 
 # ── Estado em memória (em produção use Redis para rate limit) ─────────────────
 RATE_STORE   = {}   # key → [timestamps]
@@ -704,6 +707,83 @@ def group_for_cargo(cargo):
         "monitor": "monitores", "admin": "administradores"
     }[cargo]
 
+def cargo_for_group(group):
+    return {
+        "alunos": "aluno", "professores": "professor",
+        "monitores": "monitor", "administradores": "admin"
+    }.get(group)
+
+def build_description(cpf):
+    """Codifica metadados internos (hoje só o CPF normalizado) no atributo
+    'description' do AD, já que o Samba AD não tem um campo nativo para CPF.
+    Formato: 'coude:cpf=12345678900'
+    """
+    return f"coude:cpf={normalize_cpf(cpf)}"
+
+def parse_description(description):
+    """Extrai metadados do campo description gerado por build_description()."""
+    meta = {}
+    if description.startswith("coude:"):
+        for part in description[len("coude:"):].split(";"):
+            if "=" in part:
+                k, _, v = part.partition("=")
+                meta[k.strip()] = v.strip()
+    return meta
+
+def user_fields(username):
+    """Executa 'user show' e devolve um dict com os atributos, ou None se
+    o usuário não existir."""
+    rc, out, _ = samba("user", "show", username)
+    if rc != 0:
+        return None
+    fields = {}
+    for line in out.splitlines():
+        if ":" in line:
+            k, _, v = line.partition(":")
+            fields[k.strip()] = v.strip()
+    return fields
+
+def user_summary(username, fields=None):
+    """Monta o resumo padrão de um usuário a partir dos atributos do AD."""
+    fields = fields if fields is not None else user_fields(username)
+    if fields is None:
+        return None
+    uac = fields.get("userAccountControl", "")
+    enabled = "66050" not in uac and "514" not in uac
+    dn = fields.get("dn", "")
+    meta = parse_description(fields.get("description", ""))
+    return {
+        "username":    username,
+        "displayName": fields.get("displayName", ""),
+        "email":       fields.get("mail", ""),
+        "enabled":     enabled,
+        "deletado":    "OU=Deletados" in dn,
+        "cpf":         meta.get("cpf", ""),
+        "dn":          dn,
+    }
+
+def all_usernames():
+    rc, out, err = samba("user", "list")
+    if rc != 0:
+        raise RuntimeError(err.strip())
+    return sorted(l.strip() for l in out.splitlines() if l.strip())
+
+def group_members(group):
+    """Lista membros de um grupo. Retorna None se o grupo não existir."""
+    rc, out, err = samba("group", "listmembers", group)
+    if rc != 0:
+        return None
+    return sorted(l.strip() for l in out.splitlines() if l.strip())
+
+def all_turmas():
+    rc, out, err = samba("group", "list")
+    if rc != 0:
+        raise RuntimeError(err.strip())
+    return sorted(
+        l.strip() for l in out.splitlines()
+        if l.strip().startswith("turma_")
+    )
+
 
 # =============================================================================
 # AUTH DECORATOR
@@ -744,7 +824,39 @@ def health():
     return jsonify({
         "status":    "ok" if rc == 0 else "degraded",
         "samba":     rc == 0,
+        "version":   API_VERSION,
         "timestamp": datetime.utcnow().isoformat() + "Z"
+    })
+
+
+@app.route("/api/v1", methods=["GET"])
+@app.route("/api/v1/", methods=["GET"])
+def index():
+    """Descoberta de endpoints. Não requer autenticação — não expõe dados,
+    só a lista de rotas disponíveis (útil para quem está integrando)."""
+    return jsonify({
+        "ok":      True,
+        "version": API_VERSION,
+        "docs":    "Ver coude-documentacao-tecnica.md",
+        "auth":    "Header X-API-Key em todas as rotas, exceto /health e /",
+        "endpoints": {
+            "GET  /api/v1/health":                      "Status do serviço (sem auth)",
+            "POST /api/v1/usuarios/cadastrar":           "Criar usuário",
+            "GET  /api/v1/usuarios":                     "Listar usuários (filtros: cargo, turma, status)",
+            "GET  /api/v1/usuarios/disponibilidade":     "Checar e-mail/CPF antes de cadastrar",
+            "GET  /api/v1/usuarios/<username>":          "Consultar usuário",
+            "PUT  /api/v1/usuarios/<username>":          "Atualizar nome/email/cargo",
+            "PUT  /api/v1/usuarios/<username>/turma":    "Trocar turma",
+            "POST /api/v1/usuarios/<username>/senha":    "Redefinir senha",
+            "POST /api/v1/usuarios/remover":             "Desativar (soft delete, reversível por 30 dias)",
+            "POST /api/v1/usuarios/restaurar":           "Reativar usuário desativado",
+            "DELETE /api/v1/usuarios/<username>":        "Excluir definitivamente (?confirmar=true)",
+            "GET  /api/v1/turmas":                       "Listar turmas",
+            "POST /api/v1/turmas/criar":                 "Criar turma",
+            "GET  /api/v1/turmas/<nome>/membros":        "Listar membros de uma turma",
+            "DELETE /api/v1/turmas/<nome>":               "Arquivar turma",
+            "GET  /api/v1/estatisticas":                 "Contagens gerais"
+        }
     })
 
 
@@ -783,12 +895,43 @@ def cadastrar():
     if errs:
         return jsonify({"ok": False, "errors": errs}), 422
 
+    cpf_norm = normalize_cpf(cpf)
+
+    # Verifica duplicidade de e-mail e CPF antes de gerar o username,
+    # já que o AD não impede CPFs repetidos por conta própria.
+    try:
+        for u in all_usernames():
+            f = user_fields(u)
+            if not f:
+                continue
+            if f.get("mail", "").strip().lower() == email.lower():
+                return jsonify({
+                    "ok": False,
+                    "errors": {"email": "Já existe uma conta com este e-mail"}
+                }), 409
+            meta = parse_description(f.get("description", ""))
+            if meta.get("cpf") == cpf_norm:
+                return jsonify({
+                    "ok": False,
+                    "errors": {"cpf": "Já existe uma conta com este CPF"}
+                }), 409
+    except RuntimeError:
+        logging.exception("Falha ao verificar duplicidade antes do cadastro")
+        return jsonify({
+            "ok": False,
+            "error": "Não foi possível verificar duplicidade no momento"
+        }), 500
+
     try:
         username = gen_username(nome)
         ou = ou_for_cargo(cargo)
         email_ad = f"{username}@ad.coude.com.br"
-        initial_password = f"Coude@{normalize_cpf(cpf)}!"
+        initial_password = f"Coude@{cpf_norm}!"
 
+        # --must-change-at-next-login vai direto na criação: chamar
+        # 'user setpassword' depois, sem --newpassword, exige um prompt
+        # interativo que não existe neste contexto (subprocess sem TTY) e
+        # sempre falhava, revertendo o cadastro. Ver documentação técnica.
         rc, _, err = samba(
             "user",
             "create",
@@ -800,7 +943,10 @@ def cadastrar():
             " ".join(nome.split()[1:]),
             "--mail-address",
             email_ad,
-            "--use-username-as-cn"
+            "--use-username-as-cn",
+            "--must-change-at-next-login",
+            "--description",
+            build_description(cpf)
         )
 
         if rc != 0:
@@ -812,25 +958,6 @@ def cadastrar():
             return jsonify({
                 "ok": False,
                 "error": "Não foi possível criar o usuário no Active Directory"
-            }), 500
-
-        rc, _, err = samba(
-            "user",
-            "setpassword",
-            username,
-            "--must-change-at-next-login"
-        )
-
-        if rc != 0:
-            samba("user", "delete", username)
-            logging.error(
-                "Falha ao exigir troca inicial para %s: %s",
-                username,
-                err.strip()
-            )
-            return jsonify({
-                "ok": False,
-                "error": "Não foi possível configurar a troca obrigatória da senha"
             }), 500
 
         rc, _, err = samba("user", "move", username, ou)
@@ -1042,6 +1169,328 @@ def arquivar_turma(nome):
     samba("group", "delete", nome)
     logging.info(f"Turma arquivada: {nome} → {dst}")
     return jsonify({"ok": True, "turma": nome, "status": "archived"})
+
+
+@app.route("/api/v1/turmas", methods=["GET"])
+@require_auth
+def listar_turmas():
+    log_op("/turmas")
+    try:
+        turmas = all_turmas()
+    except RuntimeError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    return jsonify({"ok": True, "total": len(turmas), "turmas": turmas})
+
+
+@app.route("/api/v1/turmas/<nome>/membros", methods=["GET"])
+@require_auth
+def membros_turma(nome):
+    log_op(f"/turmas/{nome}/membros")
+    membros = group_members(nome)
+    if membros is None:
+        return jsonify({"ok": False, "error": "Turma não encontrada"}), 404
+    return jsonify({
+        "ok": True,
+        "turma": nome,
+        "total_membros": len(membros),
+        "membros": membros
+    })
+
+
+@app.route("/api/v1/usuarios", methods=["GET"])
+@require_auth
+def listar_usuarios():
+    cargo  = request.args.get("cargo")
+    turma  = request.args.get("turma")
+    status = request.args.get("status", "ativos")  # ativos | deletados | todos
+
+    if cargo and cargo not in CARGOS:
+        return jsonify({
+            "ok": False,
+            "error": f"cargo inválido. Valores: {', '.join(CARGOS)}"
+        }), 422
+    if status not in ("ativos", "deletados", "todos"):
+        return jsonify({
+            "ok": False,
+            "error": "status inválido. Valores: ativos | deletados | todos"
+        }), 422
+
+    try:
+        page = max(1, int(request.args.get("page", 1)))
+        per_page = int(request.args.get("per_page", 50))
+    except ValueError:
+        return jsonify({"ok": False, "error": "page/per_page devem ser inteiros"}), 422
+    per_page = max(1, min(per_page, 200))
+
+    log_op("/usuarios", f"cargo={cargo} turma={turma} status={status} page={page}")
+
+    try:
+        if turma:
+            usernames = group_members(turma)
+            if usernames is None:
+                return jsonify({"ok": False, "error": "Turma não encontrada"}), 404
+        elif cargo:
+            usernames = group_members(group_for_cargo(cargo)) or []
+        else:
+            usernames = all_usernames()
+    except RuntimeError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+    usernames = sorted(set(usernames))
+    total_bruto = len(usernames)
+    start = (page - 1) * per_page
+    pagina = usernames[start:start + per_page]
+
+    usuarios = []
+    for u in pagina:
+        resumo = user_summary(u)
+        if resumo is None:
+            continue
+        if status == "ativos" and (resumo["deletado"] or not resumo["enabled"]):
+            continue
+        if status == "deletados" and not resumo["deletado"]:
+            continue
+        usuarios.append(resumo)
+
+    return jsonify({
+        "ok": True,
+        "page": page,
+        "per_page": per_page,
+        "total_geral": total_bruto,
+        "total_pagina": len(usuarios),
+        "usuarios": usuarios
+    })
+
+
+@app.route("/api/v1/usuarios/disponibilidade", methods=["GET"])
+@require_auth
+def disponibilidade():
+    email = request.args.get("email", "").strip().lower()
+    cpf   = request.args.get("cpf", "").strip()
+    if not email and not cpf:
+        return jsonify({
+            "ok": False,
+            "error": "Informe ao menos um parâmetro: email ou cpf"
+        }), 422
+
+    log_op("/usuarios/disponibilidade")
+    cpf_norm = normalize_cpf(cpf) if cpf else ""
+
+    resultado = {"ok": True}
+    if email:
+        resultado["email"] = {"valor": email, "disponivel": True}
+    if cpf:
+        resultado["cpf"] = {"valor": cpf_norm, "disponivel": True}
+
+    try:
+        for u in all_usernames():
+            f = user_fields(u)
+            if not f:
+                continue
+            if email and f.get("mail", "").strip().lower() == email:
+                resultado["email"]["disponivel"] = False
+                resultado["email"]["username"] = u
+            if cpf_norm:
+                meta = parse_description(f.get("description", ""))
+                if meta.get("cpf") == cpf_norm:
+                    resultado["cpf"]["disponivel"] = False
+                    resultado["cpf"]["username"] = u
+    except RuntimeError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+    return jsonify(resultado)
+
+
+def ldb_modify_attr(dn, attr, value):
+    """Altera um atributo LDAP diretamente no sam.ldb local via ldbmodify.
+    samba-tool não expõe um comando genérico de edição não-interativa de
+    atributos (só 'user edit', que abre um editor de texto), então
+    atributos fora do que 'user create' aceita (ex.: e-mail e nome de
+    exibição em um usuário já existente) são alterados por este caminho.
+    Executado localmente como root, sem necessidade de bind/senha."""
+    ldif = f"dn: {dn}\nchangetype: modify\nreplace: {attr}\n{attr}: {value}\n"
+    try:
+        r = subprocess.run(
+            ["ldbmodify", "-H", "/var/lib/samba/private/sam.ldb"],
+            input=ldif, capture_output=True, text=True
+        )
+        return r.returncode, r.stdout, r.stderr
+    except FileNotFoundError:
+        return 127, "", "ldbmodify não está instalado (pacote ldb-tools)"
+
+
+@app.route("/api/v1/usuarios/<username>", methods=["PUT"])
+@require_auth
+def atualizar_usuario(username):
+    fields = user_fields(username)
+    if fields is None:
+        return jsonify({"ok": False, "error": "Usuário não encontrado"}), 404
+
+    data = request.get_json(force=True) or {}
+    log_op(f"/usuarios/{username}", "update")
+
+    novo_email = data.get("email", "").strip()
+    novo_nome  = data.get("nome_completo", "").strip()
+    novo_cargo = data.get("cargo", "").strip()
+
+    if not novo_email and not novo_nome and not novo_cargo:
+        return jsonify({
+            "ok": False,
+            "error": "Informe ao menos um campo: email, nome_completo ou cargo"
+        }), 422
+
+    if novo_email and not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", novo_email):
+        return jsonify({"ok": False, "errors": {"email": "Formato inválido"}}), 422
+
+    if novo_cargo and novo_cargo not in CARGOS:
+        return jsonify({
+            "ok": False,
+            "errors": {"cargo": f"Valores: {', '.join(CARGOS)}"}
+        }), 422
+
+    alterado = {}
+    dn = fields.get("dn", "")
+
+    if novo_email:
+        rc, _, err = ldb_modify_attr(dn, "mail", novo_email)
+        if rc != 0:
+            logging.error("Falha ao atualizar e-mail de %s: %s", username, err.strip())
+            return jsonify({
+                "ok": False,
+                "error": "Não foi possível atualizar o e-mail: " + (err.strip() or "erro desconhecido")
+            }), 500
+        alterado["email"] = novo_email
+
+    if novo_nome:
+        rc, _, err = ldb_modify_attr(dn, "displayName", novo_nome)
+        if rc != 0:
+            logging.error("Falha ao atualizar nome de %s: %s", username, err.strip())
+            return jsonify({
+                "ok": False,
+                "error": "Não foi possível atualizar o nome: " + (err.strip() or "erro desconhecido")
+            }), 500
+        alterado["nome_completo"] = novo_nome
+
+    if novo_cargo:
+        cargo_atual = None
+        for c in CARGOS:
+            m = group_members(group_for_cargo(c)) or []
+            if username in m:
+                cargo_atual = c
+                break
+        if cargo_atual and cargo_atual != novo_cargo:
+            samba("group", "removemembers", group_for_cargo(cargo_atual), username)
+        rc, _, err = samba("group", "addmembers", group_for_cargo(novo_cargo), username)
+        if rc != 0:
+            return jsonify({"ok": False, "error": err.strip()}), 500
+        rc, _, err = samba("user", "move", username, ou_for_cargo(novo_cargo))
+        if rc != 0:
+            return jsonify({"ok": False, "error": err.strip()}), 500
+        alterado["cargo"] = novo_cargo
+
+    logging.info(f"Usuário atualizado: {username} campos={list(alterado.keys())}")
+    return jsonify({"ok": True, "username": username, "alterado": alterado})
+
+
+@app.route("/api/v1/usuarios/<username>/senha", methods=["POST"])
+@require_auth
+def resetar_senha(username):
+    fields = user_fields(username)
+    if fields is None:
+        return jsonify({"ok": False, "error": "Usuário não encontrado"}), 404
+
+    data = request.get_json(silent=True) or {}
+    nova_senha = data.get("senha", "").strip()
+    if nova_senha and len(nova_senha) < 8:
+        return jsonify({
+            "ok": False,
+            "errors": {"senha": "Mínimo 8 caracteres"}
+        }), 422
+    if not nova_senha:
+        nova_senha = f"Coude@{secrets.token_hex(4)}!"
+
+    log_op(f"/usuarios/{username}/senha")
+
+    rc, _, err = samba(
+        "user", "setpassword", username,
+        "--newpassword", nova_senha,
+        "--must-change-at-next-login"
+    )
+    if rc != 0:
+        logging.error("Falha ao redefinir senha de %s: %s", username, err.strip())
+        return jsonify({"ok": False, "error": err.strip() or "Falha ao redefinir senha"}), 500
+
+    logging.info(f"Senha redefinida (admin/API): {username}")
+    return jsonify({
+        "ok": True,
+        "username": username,
+        "senha_temporaria": nova_senha,
+        "must_change_password": True
+    })
+
+
+@app.route("/api/v1/usuarios/<username>", methods=["DELETE"])
+@require_auth
+def excluir_usuario_definitivo(username):
+    """Exclusão DEFINITIVA (fora do fluxo normal de soft delete/purge).
+    Requer ?confirmar=true. Use POST /usuarios/remover para o fluxo padrão
+    (soft delete + purge automático após 30 dias)."""
+    if user_fields(username) is None:
+        return jsonify({"ok": False, "error": "Usuário não encontrado"}), 404
+
+    if request.args.get("confirmar") != "true":
+        return jsonify({
+            "ok": False,
+            "error": "Confirmação obrigatória: adicione ?confirmar=true. "
+                     "Prefira POST /usuarios/remover para exclusão reversível."
+        }), 422
+
+    log_op(f"/usuarios/{username}", "hard-delete")
+
+    import shutil, time as t
+    userdir = f"{SAMBA_DATA}/users/{username}"
+    if os.path.isdir(userdir):
+        archive = f"{SAMBA_DATA}/arquivo_morto/{username}_{int(t.time())}"
+        try:
+            shutil.move(userdir, archive)
+        except OSError:
+            logging.exception("Falha ao arquivar pasta de %s antes da exclusão", username)
+
+    rc, _, err = samba("user", "delete", username)
+    if rc != 0:
+        return jsonify({"ok": False, "error": err.strip()}), 500
+
+    logging.warning(f"Exclusão DEFINITIVA: {username}")
+    return jsonify({"ok": True, "username": username, "status": "deleted_permanently"})
+
+
+@app.route("/api/v1/estatisticas", methods=["GET"])
+@require_auth
+def estatisticas():
+    log_op("/estatisticas")
+    try:
+        turmas = all_turmas()
+    except RuntimeError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+    por_cargo = {}
+    for cargo in CARGOS:
+        membros = group_members(group_for_cargo(cargo))
+        por_cargo[cargo] = len(membros) if membros else 0
+
+    por_turma = {}
+    for t in turmas:
+        membros = group_members(t)
+        por_turma[t] = len(membros) if membros else 0
+
+    return jsonify({
+        "ok": True,
+        "version": API_VERSION,
+        "total_turmas": len(turmas),
+        "usuarios_por_cargo": por_cargo,
+        "usuarios_por_turma": por_turma,
+        "total_usuarios_ativos": sum(por_cargo.values())
+    })
 
 
 # =============================================================================
